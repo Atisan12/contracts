@@ -252,3 +252,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-50 -->
 - #50: [subscription] Publishers cannot change a plan's price after creation
+
+<!-- handsoff-issue-51 -->
+- #51: [subscription] Plan ownership cannot be transferred (vault-registry supports this)
