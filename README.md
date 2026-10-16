@@ -252,3 +252,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-42 -->
 - #42: [access-lease] set_admin is single-step; a mistyped address permanently locks admin — propose two-step rotation
+
+<!-- handsoff-issue-44 -->
+- #44: [access-lease] is_compatible uses exact string match here but major/minor match in vault-registry — unify semantics
