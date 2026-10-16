@@ -94,7 +94,8 @@ pub enum Error {
     InvalidPrice = 3,
     /// Metadata pointer exceeds [`MAX_METADATA_POINTER_LEN`].
     MetadataTooLong = 4,
-    /// Tags exceed [`MAX_TAGS`], or a tag is empty or exceeds [`MAX_TAG_LEN`].
+    /// Tags exceed [`MAX_TAGS`], a tag is empty or exceeds [`MAX_TAG_LEN`], or
+    /// duplicate tags were supplied (after case-normalisation).
     InvalidTag = 5,
     /// The caller is not the configured admin.
     NotAdmin = 6,
@@ -102,6 +103,8 @@ pub enum Error {
     NotInitialised = 7,
     /// `init` has already been called; the admin cannot be overwritten.
     AlreadyInitialised = 8,
+    /// Metadata pointer must not be empty.
+    MetadataEmpty = 9,
 }
 
 /// Emitted by `init`. Topics: `("init",)`; data: admin.
@@ -223,13 +226,18 @@ impl VaultRegistry {
     /// Register a new resource.
     ///
     /// Requires the creator's authorization. The resource is listed by default.
+    /// Tags are normalised to lowercase before storage so that `"Dataset"` and
+    /// `"dataset"` are treated as identical labels; duplicate tags (after
+    /// normalisation) are rejected.
     ///
     /// # Errors
     /// - [`Error::InvalidPrice`] if `price <= 0`.
+    /// - [`Error::MetadataEmpty`] if `metadata` is an empty string.
     /// - [`Error::MetadataTooLong`] if `metadata` exceeds
     ///   [`MAX_METADATA_POINTER_LEN`].
-    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`] or any tag is
-    ///   empty or exceeds [`MAX_TAG_LEN`].
+    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`], any tag is empty
+    ///   or exceeds [`MAX_TAG_LEN`], or duplicate tags are supplied (after
+    ///   case-normalisation).
     /// - [`Error::AlreadyRegistered`] if `id` already exists.
     ///
     /// # Invariants
@@ -248,7 +256,7 @@ impl VaultRegistry {
             return Err(Error::InvalidPrice);
         }
         Self::validate_metadata_pointer(&metadata)?;
-        Self::validate_tags(&tags)?;
+        let normalised_tags = Self::validate_and_normalise_tags(&env, &tags)?;
         let key = DataKey::Resource(id.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyRegistered);
@@ -260,7 +268,7 @@ impl VaultRegistry {
             price,
             metadata,
             listed: true, // Resources are listed by default when registered
-            tags,
+            tags: normalised_tags,
         };
         env.storage().persistent().set(&key, &resource);
         Self::bump_persistent(&env, &key);
@@ -305,6 +313,7 @@ impl VaultRegistry {
     ///
     /// # Errors
     /// - [`Error::NotFound`] if no resource exists with `id`.
+    /// - [`Error::MetadataEmpty`] if `metadata` is an empty string.
     /// - [`Error::MetadataTooLong`] if `metadata` exceeds
     ///   [`MAX_METADATA_POINTER_LEN`].
     pub fn update_metadata(env: Env, id: String, metadata: String) -> Result<(), Error> {
@@ -320,19 +329,22 @@ impl VaultRegistry {
     /// Replace a resource's discovery tags.
     ///
     /// Only the creator may call this (enforced via `require_auth`). Does not
-    /// modify `metadata` (the off-chain content pointer).
+    /// modify `metadata` (the off-chain content pointer). Tags are normalised
+    /// to lowercase before storage; duplicate tags (after normalisation) are
+    /// rejected.
     ///
     /// # Errors
-    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`] or any tag is
-    ///   empty or exceeds [`MAX_TAG_LEN`].
+    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`], any tag is empty
+    ///   or exceeds [`MAX_TAG_LEN`], or duplicate tags are supplied (after
+    ///   case-normalisation).
     /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn set_tags(env: Env, id: String, tags: Vec<String>) -> Result<(), Error> {
-        Self::validate_tags(&tags)?;
+        let normalised_tags = Self::validate_and_normalise_tags(&env, &tags)?;
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
-        resource.tags = tags.clone();
+        resource.tags = normalised_tags.clone();
         Self::save(&env, &resource);
-        SetTagsEvent { id, tags }.publish(&env);
+        SetTagsEvent { id, tags: normalised_tags }.publish(&env);
         Ok(())
     }
 
@@ -384,9 +396,12 @@ impl VaultRegistry {
 
     /// Paginated resource list in insertion order.
     ///
-    /// Returns up to `limit` resources starting at insertion index `start`;
-    /// `limit` is capped at [`MAX_PAGE_SIZE`]. Missing index or resource
-    /// entries are skipped.
+    /// Returns up to `limit` full [`Resource`] values starting at insertion
+    /// index `start`; `limit` is capped at [`MAX_PAGE_SIZE`]. Missing index or
+    /// resource entries are skipped.
+    ///
+    /// For a lighter alternative that avoids transferring large metadata
+    /// strings, see [`VaultRegistry::list_ids`].
     pub fn list(env: Env, start: u32, limit: u32) -> Vec<Resource> {
         let total: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
         let page_size = limit.min(MAX_PAGE_SIZE);
@@ -405,6 +420,36 @@ impl VaultRegistry {
                 {
                     result.push_back(resource);
                 }
+            }
+            i += 1;
+        }
+        result
+    }
+
+    /// Paginated summary list — returns only resource IDs in insertion order.
+    ///
+    /// This is the lightweight alternative to [`VaultRegistry::list`]: instead
+    /// of loading full [`Resource`] values (each carrying up to
+    /// `MAX_METADATA_POINTER_LEN` bytes of metadata), this function returns
+    /// only the resource id strings, drastically reducing read bandwidth and
+    /// compute fees on large registries.
+    ///
+    /// Returns up to `limit` ids starting at insertion index `start`; `limit`
+    /// is capped at [`MAX_PAGE_SIZE`]. Missing index entries are skipped.
+    /// Callers can then fetch individual resources with [`VaultRegistry::get`]
+    /// for any ids they are interested in.
+    pub fn list_ids(env: Env, start: u32, limit: u32) -> Vec<String> {
+        let total: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+        let page_size = limit.min(MAX_PAGE_SIZE);
+        let mut result: Vec<String> = Vec::new(&env);
+        let mut i = start;
+        while i < total && result.len() < page_size {
+            if let Some(id) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, String>(&DataKey::Index(i))
+            {
+                result.push_back(id);
             }
             i += 1;
         }
@@ -475,23 +520,57 @@ impl VaultRegistry {
     }
 
     fn validate_metadata_pointer(metadata: &String) -> Result<(), Error> {
+        if metadata.len() == 0 {
+            return Err(Error::MetadataEmpty);
+        }
         if metadata.len() > MAX_METADATA_POINTER_LEN {
             return Err(Error::MetadataTooLong);
         }
         Ok(())
     }
 
-    fn validate_tags(tags: &Vec<String>) -> Result<(), Error> {
+    /// Validate and normalise a tag list.
+    ///
+    /// Each tag is lower-cased in-place so that "Dataset" and "dataset" are
+    /// treated as the same label (fixes #74). After normalisation, duplicate
+    /// tags are detected and rejected with [`Error::InvalidTag`] (fixes #73).
+    /// The count and per-tag length limits are enforced before de-dup so that
+    /// callers receive a fast early error on obviously-invalid input.
+    fn validate_and_normalise_tags(env: &Env, tags: &Vec<String>) -> Result<Vec<String>, Error> {
         if tags.len() > MAX_TAGS {
             return Err(Error::InvalidTag);
         }
+
+        let mut normalised: Vec<String> = Vec::new(env);
+
         for tag in tags.iter() {
             let len = tag.len();
             if len == 0 || len > MAX_TAG_LEN {
                 return Err(Error::InvalidTag);
             }
+
+            // Lower-case the tag byte-by-byte (ASCII only; Soroban Strings are
+            // arbitrary bytes but tags are documented as ASCII labels).
+            let mut buf = [0u8; MAX_TAG_LEN as usize];
+            tag.copy_into_slice(&mut buf[..len as usize]);
+            for b in buf[..len as usize].iter_mut() {
+                if b.is_ascii_uppercase() {
+                    *b = b.to_ascii_lowercase();
+                }
+            }
+            let lower = String::from_bytes(env, &soroban_sdk::Bytes::from_slice(env, &buf[..len as usize]));
+
+            // Reject duplicate tags (after normalisation).
+            for existing in normalised.iter() {
+                if existing == lower {
+                    return Err(Error::InvalidTag);
+                }
+            }
+
+            normalised.push_back(lower);
         }
-        Ok(())
+
+        Ok(normalised)
     }
 
     fn load(env: &Env, id: &String) -> Result<Resource, Error> {
