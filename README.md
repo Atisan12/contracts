@@ -255,3 +255,11 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-44 -->
 - #44: [access-lease] is_compatible uses exact string match here but major/minor match in vault-registry — unify semantics
+<!-- handsoff-issue-50 -->
+- #50: [subscription] Publishers cannot change a plan's price after creation
+
+<!-- handsoff-issue-51 -->
+- #51: [subscription] Plan ownership cannot be transferred (vault-registry supports this)
+
+<!-- handsoff-issue-53 -->
+- #53: [subscription] Resubscribing a cancelled-but-paid subscription adds a full cycle on top of the remaining time; confirm thi...
