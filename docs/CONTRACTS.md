@@ -196,43 +196,40 @@ A lease is **valid** iff it exists and `expires_at > ledger.sequence()`.
 |---|---|---|
 | 1 | `NotAdmin` | Reserved. |
 | 2 | `LeaseNotFound` | No lease for the pair. |
-| 3 | `AlreadyActive` | An unexpired lease already exists. |
-| 4 | `InvalidDuration` | Zero duration, or expiry would overflow. |
+| 3 | `AlreadyActive` | A non-expired lease already exists for the pair. |
+| 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. |
 | 5 | `NotInitialised` | Admin-only call before `init`. |
-| 6 | `UpgradeNotAllowed` | Reserved. |
-| 7 | `AlreadyInitialised` | `init` called twice. |
+| 6 | `AlreadyInitialised` | `init` called twice. |
 
 ---
 
 ## subscription
 
-Recurring 30-day subscription plans. Publishers define plans; the backend
-subscribes buyers after payment and renews each cycle. Subscribers can
-self-cancel and keep access through the end of the paid period.
+Recurring access plans. A publisher creates a `Plan`; the admin subscribes a
+buyer to it, and the buyer can cancel. Payment happens off-contract (x402 +
+USDC SAC); the contract records the entitlement window.
 
 ### Data
 
 ```rust
 pub struct Plan {
-    pub plan_id: String,
-    pub publisher: Address,
-    pub price_per_cycle: i128, // USDC stroops, > 0
-    pub active: bool,          // false => no new subscriptions
+    pub id: String,          // unique, immutable
+    pub publisher: Address,  // only address allowed to mutate the plan
+    pub price: i128,         // USDC stroops, > 0
+    pub period_ledgers: u32, // billing period, > 0
+    pub active: bool,        // true on create
 }
 
 pub struct Subscription {
     pub plan_id: String,
     pub subscriber: Address,
-    pub started_at: u32,
-    pub current_period_end: u32,
-    pub cancelled: bool,       // blocks renewals; access runs to period end
-    pub total_renewals: u32,
+    pub started_at: u32,     // ledger of first subscribe
+    pub expires_at: u32,     // exclusive
+    pub period_ledgers: u32, // period as of the last subscribe/renew
 }
 ```
 
-`CYCLE` = 30 days = 518,400 ledgers. A subscription is **active** iff it exists
-and `current_period_end > ledger.sequence()` — this includes cancelled
-subscriptions whose paid period has not yet ended.
+A subscription is **active** iff it exists and `expires_at > ledger.sequence()`.
 
 ### Functions
 
@@ -241,35 +238,47 @@ subscriptions whose paid period has not yet ended.
 | `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
 | `admin()` | — | `Address` | `NotInitialised` |
 | `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
-| `create_plan(publisher, plan_id, price_per_cycle)` | `publisher` | `Plan` | `InvalidPrice`, `PlanExists` |
-| `get_plan(plan_id)` | — | `Plan` | `PlanNotFound` |
-| `deactivate_plan(plan_id)` | Publisher | `()` | `PlanNotFound` |
-| `subscribe(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `PlanNotFound`, `PlanInactive`, `AlreadySubbed`, `Overflow` |
-| `renew(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `SubNotFound`, `Cancelled`, `Overflow` |
-| `cancel(plan_id, subscriber)` | `subscriber` | `()` (idempotent) | `SubNotFound` |
+| `create_plan(publisher, id, price, period_ledgers)` | `publisher` | `()` | `InvalidPrice`, `InvalidPeriod`, `AlreadyExists` |
+| `set_plan_price(id, new_price)` | Publisher | `()` | `InvalidPrice`, `NotFound` |
+| `set_plan_active(id, active)` | Publisher | `()` | `NotFound` |
+| `transfer_plan(id, new_publisher)` | Publisher | `()` | `NotFound` |
+| `subscribe(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `NotFound`, `PlanInactive`, `AlreadySubscribed` |
+| `renew(plan_id, subscriber)` | Admin | `Subscription` | `NotInitialised`, `NotFound`, `PlanInactive`, `NotSubscribed` |
+| `cancel(plan_id, subscriber)` | Subscriber | `()` | `NotSubscribed` |
 | `is_active(plan_id, subscriber)` | — | `bool` | — |
-| `get_subscription(plan_id, subscriber)` | — | `Subscription` | `SubNotFound` |
+| `get_subscription(plan_id, subscriber)` | — | `Subscription` (even if expired) | `NotSubscribed` |
+| `get_plan(id)` | — | `Plan` | `NotFound` |
 | `get_version()` | — | `String` | — |
-| `is_compatible()` | — | `bool` | — |
+| `is_compatible()` | — | `bool` — stored version == compiled | — |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
 
 **Semantics**
 
-- `subscribe` is rejected while a non-cancelled subscription is still in its
-  paid period. Re-subscribing after a cancel carries over any remaining paid
-  time (`max(current_period_end, now) + CYCLE`).
-- `renew` stacks from `max(current_period_end, now)`, and keeps working after
-  the plan is deactivated.
-- Plan ids are first-come-first-served; an existing plan can never be overwritten.
+- `create_plan` rejects a zero price or zero period.
+- `subscribe` rejects a plan that is inactive and a subscriber that already has
+  a subscription for the plan. The new window is `now + period_ledgers`.
+- `renew` extends the subscription by `period_ledgers` from `max(expires_at, now)`:
+  - While the subscription is still active (`expires_at > now`) the new expiry is
+    `expires_at + period_ledgers`, so renewals stack without losing paid time.
+  - After a lapse (`expires_at <= now`) the new expiry is `now + period_ledgers`,
+    i.e. the window restarts from the current ledger.
+  - **Gap is unbounded.** There is no cap on how long a subscription may sit
+    expired before a renewal: a renewal after any gap (days, months, years)
+    restarts a full `period_ledgers` window from `now`. This is intentional —
+    the contract does not attempt to charge or back-fill for the lapsed period,
+    and no retroactive access is granted. Callers that need to enforce a maximum
+    grace window must do so off-contract before invoking `renew`.
+  - Zero / overflowing extensions are rejected (`InvalidPeriod`).
+- `cancel` deletes the record.
 
 ### Storage
 
 | Key | Storage | Value | TTL |
 |---|---|---|---|
-| `Admin` | instance | `Address` | instance bumped to 1 year on admin calls |
+| `Admin` | instance | `Address` | instance bumped to 90 days on admin calls |
 | `Version` | instance | `String` | — |
-| `Plan(plan_id)` | persistent | `Plan` | bumped to 1 year on write |
-| `Sub(plan_id, subscriber)` | persistent | `Subscription` | bumped to 1 year on write |
+| `Plan(id)` | persistent | `Plan` | bumped to 90 days on write |
+| `Subscription(plan_id, subscriber)` | persistent | `Subscription` | bumped to 90 days on write |
 
 ### Events
 
@@ -277,10 +286,12 @@ subscriptions whose paid period has not yet ended.
 |---|---|
 | `("init",)` | admin |
 | `("setadmin",)` | new admin |
-| `("plan", plan_id, publisher)` | price per cycle |
-| `("deactiv", plan_id)` | `()` |
-| `("subscribe", plan_id, subscriber)` | `current_period_end` |
-| `("renew", plan_id, subscriber)` | new `current_period_end` |
+| `("createplan", id)` | publisher |
+| `("setprice", id)` | new price |
+| `("setactive", id)` | active |
+| `("transfer", id)` | new publisher |
+| `("subscribe", plan_id, subscriber)` | `expires_at` |
+| `("renew", plan_id, subscriber)` | new `expires_at` |
 | `("cancel", plan_id, subscriber)` | `()` |
 | `("upgrade",)` | new wasm hash |
 
@@ -289,27 +300,12 @@ subscriptions whose paid period has not yet ended.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `NotAdmin` | Reserved. |
-| 2 | `PlanNotFound` | No plan with `plan_id`. |
-| 3 | `PlanInactive` | Plan deactivated; no new subscriptions. |
-| 4 | `AlreadySubbed` | Active, non-cancelled subscription exists. |
-| 5 | `SubNotFound` | No subscription for the pair. |
-| 6 | `Cancelled` | Cannot renew a cancelled subscription. |
-| 7 | `InvalidPrice` | Price ≤ 0. |
-| 8 | `NotInitialised` | Admin-only call before `init`. |
-| 9 | `AlreadyInitialised` | `init` called twice. |
-| 10 | `PlanExists` | `plan_id` already taken. |
-| 11 | `Overflow` | Period end would overflow `u32`. |
-
----
-
-## Example (Rust test client)
-
-```rust
-let env = Env::default();
-env.mock_all_auths();
-
-let lease = AccessLeaseClient::new(&env, &env.register(AccessLease, ()));
-lease.init(&admin);
-lease.grant_lease(&String::from_str(&env, "res_1"), &buyer, &17_280); // 1 day
-assert!(lease.is_valid(&String::from_str(&env, "res_1"), &buyer));
-```
+| 2 | `NotFound` | No plan with `id`. |
+| 3 | `AlreadyExists` | `id` already registered. |
+| 4 | `InvalidPrice` | Price ≤ 0. |
+| 5 | `InvalidPeriod` | Period is zero or the resulting expiry overflows `u32`. |
+| 6 | `PlanInactive` | Plan is deactivated. |
+| 7 | `AlreadySubscribed` | Subscriber already has a subscription for the plan. |
+| 8 | `NotSubscribed` | No subscription for the pair. |
+| 9 | `NotInitialised` | Admin-only call before `init`. |
+| 10 | `AlreadyInitialised` | `init` called twice. |
