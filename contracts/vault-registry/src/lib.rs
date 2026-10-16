@@ -35,8 +35,6 @@ pub const MAX_TAG_LEN: u32 = 32;
 pub const MAX_PAGE_SIZE: u32 = 20;
 /// Contract version, sourced from the crate manifest at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Minimum version this contract is compatible with.
-pub const MIN_COMPATIBLE_VERSION: &str = "0.1.0";
 
 /// A registered vault resource.
 ///
@@ -138,12 +136,16 @@ pub struct SetPriceEvent {
     pub price: i128,
 }
 
-/// Emitted by `update_metadata`. Topics: `("updmeta", id)`; no data.
+/// Emitted by `update_metadata`. Topics: `("updmeta", id)`; data: new metadata pointer.
+///
+/// The `new_metadata` field is included so that indexers can observe the new
+/// content pointer directly from the event without an additional ledger read.
 #[contractevent(topics = ["updmeta"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateMetadataEvent {
     #[topic]
     pub id: String,
+    pub new_metadata: String,
 }
 
 /// Emitted by `set_tags`. Topics: `("settags", id)`; data: tags.
@@ -309,9 +311,9 @@ impl VaultRegistry {
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
         Self::validate_metadata_pointer(&metadata)?;
-        resource.metadata = metadata;
+        resource.metadata = metadata.clone();
         Self::save(&env, &resource);
-        UpdateMetadataEvent { id }.publish(&env);
+        UpdateMetadataEvent { id, new_metadata: metadata }.publish(&env);
         Ok(())
     }
 
@@ -353,12 +355,17 @@ impl VaultRegistry {
     /// Set the listing state of a resource.
     ///
     /// Only the creator may call this (enforced via `require_auth`).
+    /// If `listed` already matches the current value, the call is a no-op
+    /// (no storage write, no event emitted).
     ///
     /// # Errors
     /// - [`Error::NotFound`] if no resource exists with `id`.
     pub fn set_listed(env: Env, id: String, listed: bool) -> Result<(), Error> {
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
+        if resource.listed == listed {
+            return Ok(());
+        }
         resource.listed = listed;
         Self::save(&env, &resource);
         SetListedEvent { id, listed }.publish(&env);
@@ -533,18 +540,28 @@ impl VaultRegistry {
         Self::major_minor(&buf[..len]) == Self::major_minor(VERSION.as_bytes())
     }
 
-    /// Return the "major.minor" prefix of a dotted version string.
+    /// Return the "major.minor" prefix of a dotted version string, but only
+    /// when the string contains at least two dots (i.e. has a patch component).
+    /// Returns an empty slice for malformed inputs such as `"0.1"` (no patch),
+    /// preventing them from accidentally matching a valid version prefix.
     fn major_minor(version: &[u8]) -> &[u8] {
         let mut dots = 0u32;
+        let mut first_dot = 0usize;
         for (i, b) in version.iter().enumerate() {
             if *b == b'.' {
                 dots += 1;
+                if dots == 1 {
+                    first_dot = i;
+                }
                 if dots == 2 {
                     return &version[..i];
                 }
             }
         }
-        version
+        // Fewer than two dots — no patch component; return empty so the
+        // comparison always fails against any well-formed version.
+        let _ = first_dot;
+        &version[..0]
     }
 }
 
