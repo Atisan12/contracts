@@ -247,3 +247,8 @@ See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for findings and their status.
 ## License
 
 MIT © 2025 Busiii-adetiba
+
+## Handsoff notes
+
+<!-- handsoff-issue-42 -->
+- #42: [access-lease] set_admin is single-step; a mistyped address permanently locks admin — propose two-step rotation
