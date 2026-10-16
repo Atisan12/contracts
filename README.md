@@ -247,3 +247,8 @@ See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for findings and their status.
 ## License
 
 MIT © 2025 Busiii-adetiba
+
+## Handsoff notes
+
+<!-- handsoff-issue-50 -->
+- #50: [subscription] Publishers cannot change a plan's price after creation
