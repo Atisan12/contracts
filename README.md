@@ -255,3 +255,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-51 -->
 - #51: [subscription] Plan ownership cannot be transferred (vault-registry supports this)
+
+<!-- handsoff-issue-53 -->
+- #53: [subscription] Resubscribing a cancelled-but-paid subscription adds a full cycle on top of the remaining time; confirm thi...
